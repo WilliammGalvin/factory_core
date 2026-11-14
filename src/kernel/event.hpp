@@ -1,9 +1,8 @@
 #pragma once
 
-#include "kernel/priority.hpp"
-
 #include <compare>
 #include <cstdint>
+#include <kernel/priority.hpp>
 #include <limits>
 #include <type_traits>
 

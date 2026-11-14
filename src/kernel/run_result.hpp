@@ -1,8 +1,7 @@
 #pragma once
 
-#include "kernel/event.hpp"
-
 #include <cstdint>
+#include <kernel/event.hpp>
 #include <string>
 #include <vector>
 

@@ -1,10 +1,9 @@
 #pragma once
 
-#include "kernel/event.hpp"
-
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <kernel/event.hpp>
 #include <vector>
 
 namespace sim::kernel {

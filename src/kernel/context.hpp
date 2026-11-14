@@ -1,8 +1,7 @@
 #pragma once
 
-#include "kernel/event.hpp"
-#include "kernel/priority.hpp"
-
+#include <kernel/event.hpp>
+#include <kernel/priority.hpp>
 #include <string_view>
 
 namespace sim::kernel {

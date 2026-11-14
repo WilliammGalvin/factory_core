@@ -1,13 +1,27 @@
-#include "kernel/kernel.hpp"
-#include "kernel/event.hpp"
-#include "kernel/run_result.hpp"
-
-#include <cstddef>
-#include <cstdint>
-#include <utility>
-#include <vector>
+#include <exception>
+#include <kernel/event.hpp>
+#include <kernel/kernel.hpp>
+#include <kernel/run_result.hpp>
+#include <optional>
+#include <string>
 
 namespace sim::kernel {
+
+namespace {
+
+template <class Fn> std::optional<std::string> capture_error(Fn &&fn) {
+  try {
+    fn();
+  } catch (const std::exception &e) {
+    return std::string{e.what()};
+  } catch (...) {
+    return std::string{"unknown exception"};
+  }
+
+  return std::nullopt;
+}
+
+} // namespace
 
 kernel::kernel(kernel_config config) : _config(config) {
   _queue.reserve(_config.queue_reserve);
@@ -15,8 +29,8 @@ kernel::kernel(kernel_config config) : _config(config) {
 }
 
 block_id kernel::add_block(std::unique_ptr<block> blk) {
-  if (_ran)
-    throw std::logic_error("kernel::add_block() called after run()");
+  if (_started)
+    throw std::logic_error("kernel::add_block() called after start()");
 
   if (!blk)
     throw std::invalid_argument("kernel::add_block() called with nullptr");
@@ -85,88 +99,160 @@ void kernel::request_stop(block_id from, std::string_view reason) {
   _stop_detail = reason;
 }
 
-run_result kernel::run() {
-  if (_ran)
-    throw std::logic_error("kernel::run() called more than once");
+void kernel::start() {
+  if (_started)
+    return;
 
-  _ran = true;
-  run_result result;
-  bool failed = false;
+  _started = true;
+  for (slot &s : _slots) {
+    if (auto err = capture_error([&]() { s.instance->init(s.ctx); })) {
+      _fail(std::move(*err));
+      break;
+    }
+  }
+}
 
-  auto fail = [&](std::string msg) {
-    if (failed)
+bool kernel::step() {
+  start();
+  return _step(_config.end_time) == step_status::dispatched;
+}
+
+void kernel::run_until(sim_time t) {
+  start();
+
+  if (t >= _config.end_time) {
+    run_to_end();
+    return;
+  }
+
+  while (_step(t) == step_status::dispatched) {
+  }
+
+  if (!_stopped && t > _now) {
+    _now = t;
+    _tick_events = 0;
+  }
+}
+
+void kernel::run_to_end() {
+  start();
+
+  for (;;) {
+    switch (_step(_config.end_time)) {
+    case step_status::dispatched:
+      continue;
+
+    case step_status::halted:
       return;
 
-    failed = true;
-    result.reason = stop_reason::model_error;
-    result.detail = std::move(msg);
-  };
+    case step_status::idle:
+      if (_queue.empty()) {
+        _halt(stop_reason::queue_empty, {});
+      } else {
+        _now = _config.end_time;
+        _halt(stop_reason::end_time, {});
+      }
 
-  auto guarded = [&](auto &&call) {
-    try {
-      call();
-    } catch (const model_error &e) {
-      fail(e.what());
-    } catch (const std::exception &e) {
-      fail(e.what());
-    } catch (...) {
-      fail("unknown exception");
+      return;
     }
-  };
+  }
+}
 
-  for (std::size_t i = 0; i < _slots.size(); ++i) {
-    if (failed)
-      break;
+run_result kernel::finish() {
+  if (_finished)
+    throw std::logic_error("kernel::finish() called more than once");
 
-    slot &s = _slots[i];
-    guarded([&]() { s.instance->init(s.ctx); });
+  start();
+  _finished = true;
+
+  if (!_stopped) {
+    if (_stop_requested)
+      _halt(stop_reason::requested, _stop_detail);
+    else
+      _halt(stop_reason::requested, "finish() called before the run stopped");
   }
 
-  std::uint64_t tick_events = 0;
-  while (!failed) {
-    if (_stop_requested) {
-      result.reason = stop_reason::requested;
-      result.detail = _stop_detail;
-      break;
-    }
-
-    if (_queue.empty()) {
-      result.reason = stop_reason::queue_empty;
-      break;
-    }
-
-    const event e = _queue.pop();
-    if (_is_stale(e)) {
-      ++_stats.stale_discarded;
-      continue;
-    }
-
-    if (e.time > _now) {
-      _now = e.time;
-      tick_events = 0;
-    }
-
-    _record_recent(e);
-    if (++tick_events > _config.tick_event_cap) {
-      result.reason = stop_reason::tick_storm;
-      result.detail = "tick event cap exceeded";
-      result.recent_events = _collect_recent();
-      break;
-    }
-
-    slot &s = _slots[e.target];
-    guarded([&]() { s.instance->handle(s.ctx, e); });
-    ++_stats.events_dispatched;
+  for (slot &s : _slots) {
+    if (auto err = capture_error([&]() { s.instance->finish(s.ctx); }))
+      _fail(std::move(*err));
   }
 
-  for (std::size_t i = 0; i < _slots.size(); ++i) {
-    slot &s = _slots[i];
-    guarded([&]() { s.instance->finish(s.ctx); });
-  }
+  run_result result;
+  result.reason = *_stopped;
+  result.detail = _halt_detail;
+  if (result.reason == stop_reason::tick_storm ||
+      result.reason == stop_reason::model_error)
+    result.recent_events = _collect_recent();
 
   _stats.final_time = _now;
   result.stats = _stats;
   return result;
+}
+
+run_result kernel::run() {
+  if (_finished)
+    throw std::logic_error("kernel::run() called more than once");
+
+  start();
+  run_to_end();
+  return finish();
+}
+
+kernel::step_status kernel::_step(sim_time limit) {
+  if (_stopped)
+    return step_status::halted;
+
+  if (_stop_requested) {
+    _halt(stop_reason::requested, _stop_detail);
+    return step_status::halted;
+  }
+
+  while (!_queue.empty() && _is_stale(_queue.top())) {
+    _queue.pop();
+    ++_stats.stale_discarded;
+  }
+
+  if (_queue.empty() || _queue.top().time > limit)
+    return step_status::idle;
+
+  const event e = _queue.pop();
+  if (e.time > _now) {
+    _now = e.time;
+    _tick_events = 0;
+  }
+
+  _record_recent(e);
+  if (++_tick_events > _config.tick_event_cap) {
+    _halt(stop_reason::tick_storm, "tick event cap exceeded");
+    return step_status::halted;
+  }
+
+  slot &s = _slots[e.target];
+  auto err = capture_error([&]() { s.instance->handle(s.ctx, e); });
+  ++_stats.events_dispatched;
+  if (err) {
+    _fail(std::move(*err));
+    return step_status::halted;
+  }
+
+  return step_status::dispatched;
+}
+
+void kernel::_halt(stop_reason reason, std::string detail) {
+  if (_stopped)
+    return;
+
+  _stopped = reason;
+  _halt_detail = std::move(detail);
+}
+
+void kernel::_fail(std::string message) {
+  if (_stopped)
+    return;
+
+  _failed = true;
+  _stopped = stop_reason::model_error;
+  _halt_detail = std::move(message);
 }
 
 bool kernel::_is_stale(const event &e) const noexcept {

@@ -13,4 +13,4 @@ enum class priority : std::uint8_t {
   normal = 5,
 };
 
-}
+} // namespace sim::kernel

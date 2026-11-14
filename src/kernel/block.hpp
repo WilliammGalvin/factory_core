@@ -1,9 +1,8 @@
 #pragma once
 
-#include "kernel/context.hpp"
-#include "kernel/event.hpp"
-
 #include <cstddef>
+#include <kernel/context.hpp>
+#include <kernel/event.hpp>
 
 namespace sim::kernel {
 
